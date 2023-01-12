@@ -1,14 +1,18 @@
 package main
 
 import (
+	"os"
+	"os/signal"
+	"syscall"
 	"context"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"path"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guo-shaoge/supervisorProto/google.golang.org/grpc/examples/supervisor/supervisor"
@@ -28,11 +32,12 @@ import (
 
 const (
 	// NOTE: maybe different path. Talk with @woody.
-	tiflashComputeTopoAddrsPath   = "/tiflash_compute_topo/addrs"
-	tiflashComputeTopoTenantsPath = "/tiflash_compute_topo/tenants"
-	supervisorPort                = "7000"
-	defaultTiFlashPort            = "3930"
-	topoSep                       = ";"
+	etcdAddrsPath      = "/tiflash_compute_topo/addrs"
+	etcdTenantsPath    = "/tiflash_compute_topo/tenants"
+	supervisorPort     = "7000"
+	tiflashServicePort = "3930"
+	topoSep            = ";"
+
 	// If change this, also need to change Dockerfile.
 	mockAutoScalerPort = "8888"
 )
@@ -48,6 +53,8 @@ var (
 	infoLogger  *log.Logger
 	debugLogger *log.Logger
 	globalTopo  *computeTopo
+	// TODO: maybe better performance.
+	mu sync.Mutex
 )
 
 func initLogger(basePath string) {
@@ -95,9 +102,11 @@ func getEtcdTopo(path string) (fullTopo string, errMsg string) {
 		errMsg = fmt.Sprintf("get etcd failed. err: %s", err.Error())
 		return
 	}
-	if len(etcdGetResp.Kvs) != 1 {
+	if len(etcdGetResp.Kvs) > 1 {
 		errMsg = fmt.Sprintf("unexpected etcd kv length, got: %d", len(etcdGetResp.Kvs))
 		return
+	} else if len(etcdGetResp.Kvs) == 0 {
+		infoLogger.Printf("etcd kv length is 0")
 	} else {
 		fullTopo = string(etcdGetResp.Kvs[0].Value)
 		infoLogger.Printf("etcd is not empty, ori is: %s", fullTopo)
@@ -111,7 +120,7 @@ func putEtcdTopo(val, path string) (errMsg string) {
 		errMsg = fmt.Sprintf("put etcd failed. err: %s", err.Error())
 		return
 	}
-	infoLogger.Printf("put etcd succeed. resp: %v", etcdPutResp)
+	infoLogger.Printf("put etcd succeed. val: %s, path: %s, resp: %v", val, path, etcdPutResp)
 	return
 }
 
@@ -136,6 +145,8 @@ func splitAndDelete(val, del string) (newVal string, errMsg string) {
 }
 
 func httpScaleOut(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
 	infoLogger.Printf("[http] got ScaleOut http request: %s", r.URL.String())
 
 	podIP, tenantName, err := parseRequest(r)
@@ -178,18 +189,18 @@ func httpScaleOut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update etcd topo.
-	fullTopo, errMsg := getEtcdTopo(tiflashComputeTopoAddrsPath)
+	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
-	fullTenants, errMsg := getEtcdTopo(tiflashComputeTopoTenantsPath)
+	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
 
-	addedTiFlashAddr := podIP + ":" + defaultTiFlashPort
+	addedTiFlashAddr := podIP + ":" + tiflashServicePort
 	if len(fullTopo) == 0 {
 		fullTopo = addedTiFlashAddr
 		fullTenants = tenantName
@@ -200,14 +211,25 @@ func httpScaleOut(w http.ResponseWriter, r *http.Request) {
 		fullTenants += topoSep + tenantName
 	}
 
-	putEtcdTopo(tiflashComputeTopoAddrsPath, fullTopo)
-	putEtcdTopo(tiflashComputeTopoTenantsPath, fullTenants)
+	// TODO: Txn
+	errMsg = putEtcdTopo(etcdAddrsPath, fullTopo)
+	if len(errMsg) != 0 {
+		writeError(w, http.StatusInternalServerError, errMsg)
+		return
+	}
+	errMsg = putEtcdTopo(etcdTenantsPath, fullTenants)
+	if len(errMsg) != 0 {
+		writeError(w, http.StatusInternalServerError, errMsg)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	return
 }
 
 func httpScaleIn(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
 	infoLogger.Printf("[http] got ScaleIn http request: %s", r.URL.String())
 
 	podIP, tenantName, err := parseRequest(r)
@@ -251,12 +273,12 @@ func httpScaleIn(w http.ResponseWriter, r *http.Request) {
 	// Update etcd topo.
 	var fullTopo string
 
-	fullTopo, errMsg := getEtcdTopo(tiflashComputeTopoAddrsPath)
+	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
-	fullTenants, errMsg := getEtcdTopo(tiflashComputeTopoTenantsPath)
+	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
@@ -282,48 +304,87 @@ func httpScaleIn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	putEtcdTopo(tiflashComputeTopoAddrsPath, newFullTopo)
-	putEtcdTopo(tiflashComputeTopoTenantsPath, newFullTenants)
-
-	w.WriteHeader(http.StatusOK)
-	return
-}
-
-func httpGetTopo(w http.ResponseWriter, r *http.Request) {
-	infoLogger.Printf("[http] got GetTopo http request: %s", r.URL.String())
-
-	var fullTopo string
-	etcdGetResp, err := etcdcliv3.NewKV(etcdCli).Get(context.TODO(), tiflashComputeTopoAddrsPath)
-	if err != nil {
-		errMsg := fmt.Sprintf("get etcd failed. err: %s", err.Error())
+	errMsg = putEtcdTopo(etcdAddrsPath, newFullTopo)
+	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
-	if len(etcdGetResp.Kvs) > 1 {
-		errMsg := fmt.Sprintf("unexpected etcd kv length, got: %d", len(etcdGetResp.Kvs))
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	} else if len(etcdGetResp.Kvs) == 0 {
-		infoLogger.Printf("etcd is empty")
-	} else {
-		fullTopo = string(etcdGetResp.Kvs[0].Value)
-		infoLogger.Printf("etcd is not empty, fullTopo is: %s", fullTopo)
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fullTopo))
-	return
-}
-
-func httpReset(w http.ResponseWriter, r *http.Request) {
-	infoLogger.Printf("[http] got Reset http request: %s", r.URL.String())
-
-	fullTopo, errMsg := getEtcdTopo(tiflashComputeTopoAddrsPath)
+	errMsg = putEtcdTopo(etcdTenantsPath, newFullTenants)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
 
-	fullTenants, errMsg := getEtcdTopo(tiflashComputeTopoTenantsPath)
+	w.WriteHeader(http.StatusOK)
+	return
+}
+
+func httpFetchTopo(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	infoLogger.Printf("[http] got FetchTopo http request: %s", r.URL.String())
+
+	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
+	if len(errMsg) != 0 {
+		writeError(w, http.StatusInternalServerError, errMsg)
+		return
+	}
+	infoLogger.Printf("[http] FetchTopo done: %s", fullTopo)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fullTopo))
+	return
+}
+
+// NOTE: MockAutoScaler doesn't know the whole topo of tiflash_compute, it relies on endless case,
+// so we only check if we can satisfy node_num, if not just return error.
+func httpAssumeAndGetTopo(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	infoLogger.Printf("[http] got AssumeAndGetTopo request: %s", r.URL.String())
+
+	nodeNumStr := r.FormValue("node_num")
+	if nodeNumStr == "" {
+		writeError(w, http.StatusBadRequest, "node_num is empty")
+		return
+	}
+	nodeNum, err := strconv.Atoi(nodeNumStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("node_num cannot convert to int. %s, %s", nodeNumStr, err.Error()))
+		return
+	}
+	if nodeNum <= 0 {
+		writeError(w, http.StatusBadRequest, "node_num cannot be zero")
+		return
+	}
+
+	fullAddrs, errMsg := getEtcdTopo(etcdAddrsPath)
+	if errMsg != "" {
+		writeError(w, http.StatusInternalServerError, errMsg)
+		return
+	}
+	addrs := strings.Split(fullAddrs, topoSep)
+	if len(addrs) < nodeNum {
+		writeError(w, http.StatusInternalServerError, "node num too large, try to ScaleOut first")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fullAddrs))
+	return
+}
+
+func httpReset(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	infoLogger.Printf("[http] got Reset http request: %s", r.URL.String())
+
+	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
+	if len(errMsg) != 0 {
+		writeError(w, http.StatusInternalServerError, errMsg)
+		return
+	}
+
+	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
 	if len(errMsg) != 0 {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
@@ -387,10 +448,30 @@ func httpHomePage(w http.ResponseWriter, r *http.Request) {
 		`Unexpected url path. You can try:
 	1. ScaleOut tiflash_compute node: ip:port/scale_out_compute?pod_ip=x.x.x.x&tenant_name=x
 	2. ScaleIn tiflash_compute node: ip:port/scale_in_compute?pod_ip=x.x.x.x&tenant_name=x
-	3. GetTopo: ip:port/get_topo
+	3. GetTopo: ip:port/fetch_topo
 `
 	w.Write([]byte(errMsg))
 	return
+}
+
+func startHttpServer(wg *sync.WaitGroup) *http.Server {
+	wg.Add(1)
+	srv := &http.Server{Addr:":"+mockAutoScalerPort}
+
+	http.HandleFunc("/scale_out_compute", httpScaleOut)
+	http.HandleFunc("/scale_in_compute", httpScaleIn)
+	http.HandleFunc("/fetch_topo", httpFetchTopo)
+	http.HandleFunc("/reset", httpReset)
+	http.HandleFunc("/assume-and-get-topo", httpAssumeAndGetTopo)
+	http.HandleFunc("/", httpHomePage)
+
+	go func() {
+		defer wg.Done()
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe(): %v", err)
+		}
+	}()
+	return srv
 }
 
 func main() {
@@ -426,20 +507,33 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// HTTP Server.
+	sigs := make(chan os.Signal, 1)
+	done := make(chan bool, 1)
+	//registers the channel
+	signal.Notify(sigs, syscall.SIGTERM)
+
 	go func() {
-		// ip:port/scale_out_compute?pod_ip=x.x.x.x&tenant_name=x
-		http.HandleFunc("/scale_out_compute", httpScaleOut)
-		http.HandleFunc("/scale_in_compute", httpScaleIn)
-		http.HandleFunc("/get_topo", httpGetTopo)
-		http.HandleFunc("/reset", httpReset)
-		http.HandleFunc("/", httpHomePage)
-		// TODO: gracefule shutdown.
-		http.ListenAndServe(":"+mockAutoScalerPort, nil)
-	}()
+		<-sigs
+		log.Println("Caught SIGTERM, shutting down")
+		done <- true
+    }()
+
+	// HTTP Server.
+	httpSrvDone := &sync.WaitGroup{}
+	httpSrv := startHttpServer(httpSrvDone)
+
+	stopServers := func() {
+		err := httpSrv.Shutdown(context.TODO())
+		log.Println(err)
+		httpSrvDone.Wait()
+		etcdServer.Server.Stop()
+	}
 
 	select {
 	case err = <-etcdServer.Err():
-		log.Fatal(err)
+		log.Println(err)
+		stopServers()
+	case <-done:
+		stopServers()
 	}
 }
