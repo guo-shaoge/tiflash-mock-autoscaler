@@ -1,18 +1,18 @@
 package main
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
 	"context"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/guo-shaoge/supervisorProto/google.golang.org/grpc/examples/supervisor/supervisor"
@@ -43,8 +43,8 @@ const (
 )
 
 type computeTopo struct {
-	addrs   []string
-	tenants []string
+	Addrs   []string
+	Tenants []string
 }
 
 var (
@@ -68,26 +68,36 @@ func initLogger(basePath string) {
 	debugLogger = log.New(w, "[DEBUG]", log.Ldate|log.Ltime|log.Lmicroseconds)
 }
 
-func parseRequest(r *http.Request) (string, string, error) {
+func parseRequest(r *http.Request) (string, string, string, error) {
 	// Get assign info: podIP and tenantName.
 	podIPs, ok := r.URL.Query()["pod_ip"]
 	if !ok {
-		return "", "", fmt.Errorf("cannot find pod_ip parameter in url. url: %s", r.URL.String())
+		return "", "", "", fmt.Errorf("cannot find pod_ip parameter in url. url: %s", r.URL.String())
 	}
 	if len(podIPs) != 1 {
-		return "", "", fmt.Errorf("length of podIP in url is not 1. len: %d, url: %s", len(podIPs), r.URL.String())
+		return "", "", "", fmt.Errorf("length of podIP in url is not 1. len: %d, url: %s", len(podIPs), r.URL.String())
 	}
 	podIP := podIPs[0]
+
 	tenantNames, ok := r.URL.Query()["tenant_name"]
 	if !ok {
-		return "", "", fmt.Errorf("cannot find tenant_name parameter in url. url: %s", r.URL.String())
+		return "", "", "", fmt.Errorf("cannot find tenant_name parameter in url. url: %s", r.URL.String())
 	}
 	if len(tenantNames) != 1 {
-		return "", "", fmt.Errorf("length of tenantNames in url is not 1. len: %d, url: %s", len(podIPs), r.URL.String())
+		return "", "", "", fmt.Errorf("length of tenantNames in url is not 1. len: %d, url: %s", len(podIPs), r.URL.String())
 	}
 	tenantName := tenantNames[0]
 
-	return podIP, tenantName, nil
+	var pdAddr string
+	pdAddrs, ok := r.URL.Query()["pd_addr"]
+	if !ok {
+		return podIP, tenantName, pdAddr, nil
+	}
+	if len(tenantNames) != 1 {
+		return "", "", "", fmt.Errorf("length of pd_addr in url is not 1. len: %d, url: %s", len(podIPs), r.URL.String())
+	}
+	pdAddr = pdAddrs[0]
+	return podIP, tenantName, pdAddr, nil
 }
 
 func writeError(w http.ResponseWriter, resStatus int, errMsg string) {
@@ -149,9 +159,14 @@ func httpScaleOut(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	infoLogger.Printf("[http] got ScaleOut http request: %s", r.URL.String())
 
-	podIP, tenantName, err := parseRequest(r)
+	podIP, tenantName, pdAddr, err := parseRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(pdAddr) == 0 {
+		errMsg := fmt.Sprintf("pdAddr is empty")
+		writeError(w, http.StatusBadRequest, errMsg)
 		return
 	}
 
@@ -176,7 +191,7 @@ func httpScaleOut(w http.ResponseWriter, r *http.Request) {
 	grpcResp, err :=
 		c.AssignTenant(
 			ctx,
-			&supervisor.AssignRequest{TenantID: tenantName, TidbStatusAddr: mockAddr, PdAddr: mockAddr})
+			&supervisor.AssignRequest{TenantID: tenantName, TidbStatusAddr: mockAddr, PdAddr: pdAddr})
 	if err != nil {
 		errMsg := fmt.Sprintf("call AssignTenant grpc failed. addr: %s, err: %v", grpcAddr, err)
 		writeError(w, http.StatusInternalServerError, errMsg)
@@ -188,40 +203,9 @@ func httpScaleOut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update etcd topo.
-	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-
-	addedTiFlashAddr := podIP + ":" + tiflashServicePort
-	if len(fullTopo) == 0 {
-		fullTopo = addedTiFlashAddr
-		fullTenants = tenantName
-		infoLogger.Printf("etcd is empty, will add %s", addedTiFlashAddr)
-	} else {
-		infoLogger.Printf("etcd is not empty, ori is: %s, will add %s", fullTopo, addedTiFlashAddr)
-		fullTopo += topoSep + addedTiFlashAddr
-		fullTenants += topoSep + tenantName
-	}
-
-	// TODO: Txn
-	errMsg = putEtcdTopo(etcdAddrsPath, fullTopo)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	errMsg = putEtcdTopo(etcdTenantsPath, fullTenants)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
+	tiflashAddr := podIP + ":" + tiflashServicePort
+	globalTopo.Addrs = append(globalTopo.Addrs, tiflashAddr)
+	globalTopo.Tenants = append(globalTopo.Tenants, tenantName)
 
 	w.WriteHeader(http.StatusOK)
 	return
@@ -232,7 +216,7 @@ func httpScaleIn(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	infoLogger.Printf("[http] got ScaleIn http request: %s", r.URL.String())
 
-	podIP, tenantName, err := parseRequest(r)
+	podIP, tenantName, _, err := parseRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -269,48 +253,19 @@ func httpScaleIn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
+	infoLogger.Printf("scale in UnassignRequest rpc done")
 
-	// Update etcd topo.
-	var fullTopo string
-
-	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-
-	var newFullTopo string
-	var newFullTenants string
-	delTenant := tenantName
-	delAddr := podIP + ":" + supervisorPort
-	if len(fullTopo) == 0 {
-		infoLogger.Printf("etcd is empty, skip scale-in %s, %s", delAddr, delTenant)
-	} else {
-		infoLogger.Printf("etcd is not empty, ori is: %s, will scale-in %s, %s", fullTopo, delAddr, delTenant)
-		newFullTopo, errMsg = splitAndDelete(fullTopo, delAddr)
-		if len(errMsg) != 0 {
-			writeError(w, http.StatusInternalServerError, errMsg)
-			return
-		}
-		newFullTenants, errMsg = splitAndDelete(fullTenants, delTenant)
-		if len(errMsg) != 0 {
-			writeError(w, http.StatusInternalServerError, errMsg)
-			return
+	tiflashAddr := podIP + ":" + tiflashServicePort
+	var deleted bool
+	for i := 0; i < len(globalTopo.Addrs); i++ {
+		if globalTopo.Addrs[i] == tiflashAddr && globalTopo.Tenants[i] == tenantName {
+			globalTopo.Addrs = append(globalTopo.Addrs[:i], globalTopo.Addrs[i+1:]...)
+			globalTopo.Tenants = append(globalTopo.Tenants[:i], globalTopo.Tenants[i+1:]...)
+			deleted = true
 		}
 	}
-
-	errMsg = putEtcdTopo(etcdAddrsPath, newFullTopo)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	errMsg = putEtcdTopo(etcdTenantsPath, newFullTenants)
-	if len(errMsg) != 0 {
+	if !deleted {
+		errMsg := fmt.Sprintf("delete %s,%s failed from %v, %v", tiflashAddr, tenantName, globalTopo.Addrs, globalTopo.Tenants)
 		writeError(w, http.StatusInternalServerError, errMsg)
 		return
 	}
@@ -319,17 +274,23 @@ func httpScaleIn(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
+func constructTopoStr(vals []string) string {
+	var fullTopo string
+	for i := 0; i < len(vals); i++ {
+		if len(fullTopo) != 0 {
+			fullTopo += ";"
+		}
+		fullTopo += vals[i]
+	}
+	return fullTopo
+}
+
 func httpFetchTopo(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	infoLogger.Printf("[http] got FetchTopo http request: %s", r.URL.String())
 
-	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	infoLogger.Printf("[http] FetchTopo done: %s", fullTopo)
+	fullTopo := constructTopoStr(globalTopo.Addrs)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fullTopo))
@@ -358,18 +319,13 @@ func httpAssumeAndGetTopo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fullAddrs, errMsg := getEtcdTopo(etcdAddrsPath)
-	if errMsg != "" {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-	addrs := strings.Split(fullAddrs, topoSep)
-	if len(addrs) < nodeNum {
+	if len(globalTopo.Addrs) < nodeNum {
 		writeError(w, http.StatusInternalServerError, "node num too large, try to ScaleOut first")
 		return
 	}
+	fullTopo := constructTopoStr(globalTopo.Addrs)
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fullAddrs))
+	w.Write([]byte(fullTopo))
 	return
 }
 
@@ -378,26 +334,8 @@ func httpReset(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	infoLogger.Printf("[http] got Reset http request: %s", r.URL.String())
 
-	fullTopo, errMsg := getEtcdTopo(etcdAddrsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-
-	fullTenants, errMsg := getEtcdTopo(etcdTenantsPath)
-	if len(errMsg) != 0 {
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
-
-	addrList := strings.Split(fullTopo, topoSep)
-	tenantList := strings.Split(fullTenants, topoSep)
-
-	if len(addrList) != len(tenantList) {
-		errMsg := fmt.Sprintf("len(addrList)(%d) != len(tenantList)(%d)", len(addrList), len(tenantList))
-		writeError(w, http.StatusInternalServerError, errMsg)
-		return
-	}
+	addrList := globalTopo.Addrs
+	tenantList := globalTopo.Tenants
 
 	for i := 0; i < len(addrList); i++ {
 		tenantName := tenantList[i]
@@ -439,6 +377,10 @@ func httpReset(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	globalTopo.Addrs = []string{}
+	globalTopo.Tenants = []string{}
+	w.WriteHeader(http.StatusOK)
+	return
 }
 
 func httpHomePage(w http.ResponseWriter, r *http.Request) {
@@ -456,7 +398,7 @@ func httpHomePage(w http.ResponseWriter, r *http.Request) {
 
 func startHttpServer(wg *sync.WaitGroup) *http.Server {
 	wg.Add(1)
-	srv := &http.Server{Addr:":"+mockAutoScalerPort}
+	srv := &http.Server{Addr: ":" + mockAutoScalerPort}
 
 	http.HandleFunc("/scale_out_compute", httpScaleOut)
 	http.HandleFunc("/scale_in_compute", httpScaleIn)
@@ -479,8 +421,8 @@ func main() {
 	basePath := "/tiflash-mock-autoscaler"
 	initLogger(basePath)
 	globalTopo = &computeTopo{
-		addrs:   []string{},
-		tenants: []string{},
+		Addrs:   []string{},
+		Tenants: []string{},
 	}
 
 	// Etcd Server.
@@ -516,7 +458,7 @@ func main() {
 		<-sigs
 		log.Println("Caught SIGTERM, shutting down")
 		done <- true
-    }()
+	}()
 
 	// HTTP Server.
 	httpSrvDone := &sync.WaitGroup{}
